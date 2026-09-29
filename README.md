@@ -5,8 +5,10 @@ with **Qwen3.6-35B-A3B on SGLang**.
 
 ![](https://i.imgur.com/wHM3jxV.gif)
 
-Each container one B200 with SGLang **0.5.19's Rust frontend**,
-radix caching, and **breakable prefill CUDA graphs**. A separate Python API process
+Each container one B200 with SGLang **0.5.19**,
+radix caching, and **breakable prefill CUDA graphs**. The Modal deployment uses SGLang's
+Python frontend so it can restore from **GPU memory snapshots**; elsewhere the default
+is SGLang's Rust frontend. A separate Python API process
 uses FastAPI, uvloop, the Rust-backed HF tokenizer, and pooled asynchronous HTTP
 connections to SGLang on localhost. CUDA dependencies stay in SGLang's container;
 `uv sync` on your laptop installs only the API, deployment tools, and tests.
@@ -74,10 +76,22 @@ The first build imports a large SGLang image. The first GPU start also downloads
 weights and compiles/captures kernels. Model weights persist in the
 `openjev-huggingface` Modal Volume, alongside SGLang's tuning cache and Triton
 compilation cache. Later starts reuse these files; CUDA graph capture still runs
-at startup. The Rust frontend receives an explicit local tokenizer directory to
+at startup. SGLang receives an explicit local tokenizer directory to
 avoid remote-name lookup issues with revision-pinned snapshots.
 A scaled-to-zero Server returns **503** while it
 starts; the included smoke command retries startup responses.
+
+The Server also uses Modal
+[GPU memory snapshots](https://modal.com/docs/guide/memory-snapshot). The first
+start after each deploy runs the full startup (about seven minutes), sends one
+warmup evaluation, then puts SGLang to sleep (`/release_memory_occupation`, with
+`--enable-memory-saver --enable-weights-cpu-backup`) before Modal snapshots the
+container. Later cold starts restore that snapshot, wake SGLang
+(`/resume_memory_occupation`), flush the radix cache, and verify one evaluation:
+about 30 seconds of container startup instead of about 3.5 minutes, plus however
+long Modal takes to allocate a B200. SGLang's sleep and wake endpoints exist only in
+its Python frontend, so snapshots select `OPENJEV_FRONTEND=python`. Deploy with
+`OPENJEV_GPU_SNAPSHOT=0` to disable snapshots and use the Rust frontend.
 
 ```sh
 uv run openjev smoke https://YOUR-SERVER.us-west.modal.direct

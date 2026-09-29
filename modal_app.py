@@ -22,6 +22,20 @@ proxy_token = modal.Secret.from_name(
 )
 password = modal.Secret.from_name("openjev-sglang-api-key", required_keys=["OPENJEV_API_KEY"])
 
+# GPU memory snapshots skip imports, weight loading, and CUDA graph capture on cold
+# starts. SGLang's sleep/wake endpoints exist only in its Python frontend, and the
+# weights' CPU backup needs more container memory. OPENJEV_GPU_SNAPSHOT=0 disables.
+GPU_SNAPSHOT = os.environ.get("OPENJEV_GPU_SNAPSHOT", "1") == "1"
+FRONTEND = os.environ.get("OPENJEV_FRONTEND", "python" if GPU_SNAPSHOT else "rust")
+if GPU_SNAPSHOT and FRONTEND != "python":
+    raise ValueError("OPENJEV_GPU_SNAPSHOT=1 requires OPENJEV_FRONTEND=python")
+SNAPSHOT_SGLANG_ARGS = ["--enable-memory-saver", "--enable-weights-cpu-backup"]
+# One small real evaluation, run before each snapshot and after each restore.
+WARMUP_REQUEST = (
+    b'{"model": "jev-latest", "state": "I was charged twice. Please refund it.",'
+    b' "questions": {"refund": {"type": "noul", "instructions": "Refund request?"}}}'
+)
+
 # Keep SGLang's tested CUDA environment intact. uv owns a separate, small API
 # environment; the package starts SGLang using the base image's Python.
 image = (
@@ -41,7 +55,9 @@ image = (
             "SGLANG_CACHE_DIR": "/cache/huggingface/runtime/sglang",
             "TRITON_CACHE_DIR": "/cache/huggingface/runtime/triton",
             "TOKENIZERS_PARALLELISM": "false",
-            "OPENJEV_FRONTEND": os.environ.get("OPENJEV_FRONTEND", "rust"),
+            "OPENJEV_FRONTEND": FRONTEND,
+            # Parallel Inductor compile workers can break snapshot creation.
+            "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "OPENJEV_PROFILE": PROFILE_NAME,
             "OPENJEV_SERVED_MODEL_NAME": os.environ.get(
                 "OPENJEV_SERVED_MODEL_NAME", profile.served_model_name
@@ -55,7 +71,7 @@ image = (
     image=image,
     gpu="B200",
     cpu=8,
-    memory=profile.memory_mib,
+    memory=max(profile.memory_mib, 65536) if GPU_SNAPSHOT else profile.memory_mib,
     volumes={"/cache/huggingface": cache},
     port=8000,
     routing_region="us-west",
@@ -66,13 +82,29 @@ image = (
     scaledown_window=300,
     startup_timeout=1200,
     exit_grace_period=30,
+    enable_memory_snapshot=GPU_SNAPSHOT,
+    experimental_options={"enable_gpu_snapshot": True} if GPU_SNAPSHOT else None,
 )
 class OpenJev:
-    @modal.enter()
+    # With snapshots on, this runs once per snapshot; restores resume after it.
+    @modal.enter(snap=GPU_SNAPSHOT)
     def startup(self):
-        from openjev.launch import start_background
+        from openjev.launch import sleep_backend, start_background
 
-        self.process = start_background("/opt/openjev/.venv/bin/python", profile.backend_python)
+        self.process = start_background(
+            "/opt/openjev/.venv/bin/python",
+            profile.backend_python,
+            sglang_args=SNAPSHOT_SGLANG_ARGS if GPU_SNAPSHOT else None,
+        )
+        if GPU_SNAPSHOT:
+            sleep_backend("http://127.0.0.1:8000", "http://127.0.0.1:30000", WARMUP_REQUEST)
+
+    @modal.enter(snap=False)
+    def wake(self):
+        from openjev.launch import wake_backend
+
+        if GPU_SNAPSHOT:
+            wake_backend("http://127.0.0.1:8000", "http://127.0.0.1:30000", WARMUP_REQUEST)
 
     @modal.exit()
     def shutdown(self):
