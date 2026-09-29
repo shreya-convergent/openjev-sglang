@@ -15,8 +15,12 @@ PROFILE_NAME = os.environ.get("OPENJEV_PROFILE", "qwen36")
 profile = PROFILES[PROFILE_NAME]
 app = modal.App(profile.app_name)
 cache = modal.Volume.from_name("openjev-huggingface", create_if_missing=True)
-# Modal proxy auth token as "wk-....ws-...", used by the web app to warm the Server.
-proxy_token = modal.Secret.from_name("openjev-sglang-proxy-auth", required_keys=["OPENJEV_API_KEY"])
+# MODAL_PROXY_TOKEN ("wk-....ws-...") lets the web app reach the proxy-authenticated
+# Server. OPENJEV_API_KEY is the shared password callers send to the web app.
+proxy_token = modal.Secret.from_name(
+    "openjev-sglang-proxy-auth", required_keys=["MODAL_PROXY_TOKEN"]
+)
+password = modal.Secret.from_name("openjev-sglang-api-key", required_keys=["OPENJEV_API_KEY"])
 
 # Keep SGLang's tested CUDA environment intact. uv owns a separate, small API
 # environment; the package starts SGLang using the base image's Python.
@@ -78,10 +82,10 @@ class OpenJev:
             stop_background(self.process)
 
 
-# The Server requires Modal proxy auth, so Modal rejects unauthenticated requests
-# before they can start a B200. This CPU-only web app hosts what a browser needs:
-# the API reference, a warm-up route, and a same-origin pass-through to the Server
-# that forwards the caller's own credentials (it never adds its own).
+# The Server requires Modal proxy auth, and only this CPU-only web app holds the
+# token. Callers send the shared password here instead; wrong passwords are
+# rejected on CPU, so they never start a B200. The web app hosts the API
+# reference, a warm-up route, and a pass-through to the Server.
 web_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install(
@@ -93,8 +97,7 @@ web_image = (
     )
     .add_local_python_source("openjev")
 )
-# Modal strips Modal-Key/Modal-Secret before they reach the app, so callers use Bearer.
-FORWARDED_REQUEST_HEADERS = {"authorization", "content-type"}
+FORWARDED_REQUEST_HEADERS = {"content-type"}
 FORWARDED_RESPONSE_HEADERS = {"content-type", "retry-after", "server-timing"}
 
 
@@ -116,42 +119,52 @@ async def _server_ready(client) -> bool:
     return response.is_success
 
 
-@app.function(image=web_image, secrets=[proxy_token], timeout=1500)
+def _server_client(url: str, **kwargs):
+    return _client(
+        url, headers={"Authorization": f"Bearer {os.environ['MODAL_PROXY_TOKEN']}"}, **kwargs
+    )
+
+
+# One poller at a time: repeated /warm calls queue behind it and exit at once.
+@app.function(image=web_image, secrets=[proxy_token], timeout=1500, max_containers=1)
 async def wait_until_ready():
     """Poll a cold Server (503 while starting) until /health succeeds."""
     import asyncio
+    import time
 
     url = await OpenJev.get_url.aio()
-    auth = {"Authorization": f"Bearer {os.environ['OPENJEV_API_KEY']}"}
-    async with _client(url, headers=auth) as client:
+    started = time.monotonic()
+    async with _server_client(url) as client:
         while not await _server_ready(client):
+            print(f"Server still starting ({time.monotonic() - started:.0f}s); retrying in 5s")
             await asyncio.sleep(5)
+    print(f"Server ready after {time.monotonic() - started:.0f}s: {url}")
 
 
-@app.function(image=web_image, secrets=[proxy_token])
+@app.function(image=web_image, secrets=[proxy_token, password])
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app(label=f"{profile.app_name}-web")
 def web():
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import HTMLResponse, Response
+    from fastapi.responses import HTMLResponse, JSONResponse, Response
 
     from openjev.api import create_app
     from openjev.config import Settings
 
-    token = os.environ["OPENJEV_API_KEY"]
+    expected = f"Bearer {os.environ['OPENJEV_API_KEY']}"
     web = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     schema = create_app(Settings()).openapi()
     schema["components"]["securitySchemes"] = {
-        "modal": {
+        "password": {
             "type": "http",
             "scheme": "bearer",
-            "description": "Modal proxy auth token, formatted as `wk-....ws-...`.",
+            "description": "The shared OpenJev password.",
         }
     }
-    schema["security"] = [{"modal": []}]
+    schema["security"] = [{"password": []}]
 
     def authorized(request: Request) -> bool:
-        return secrets.compare_digest(request.headers.get("authorization", ""), f"Bearer {token}")
+        return secrets.compare_digest(request.headers.get("authorization", ""), expected)
 
     @web.get("/", include_in_schema=False)
     async def reference():
@@ -179,9 +192,9 @@ def web():
     async def warm(request: Request):
         """Return immediately: "ready" if a GPU container is serving, else start one."""
         if not authorized(request):
-            raise HTTPException(401, "Missing or invalid Modal proxy auth token")
+            raise HTTPException(401, "Missing or invalid password", {"WWW-Authenticate": "Bearer"})
         url = await OpenJev.get_url.aio()
-        async with _client(url, headers={"Authorization": f"Bearer {token}"}) as client:
+        async with _server_client(url) as client:
             try:
                 if await _server_ready(client):
                     return {"status": "ready", "url": url}
@@ -194,11 +207,25 @@ def web():
     async def forward(path: str, request: Request):
         if path not in {"v1/systemone", "v1/models", "v1/limits", "health", "health/live"}:
             raise HTTPException(404)
+        if not authorized(request):
+            raise HTTPException(401, "Missing or invalid password", {"WWW-Authenticate": "Bearer"})
         headers = {k: v for k, v in request.headers.items() if k in FORWARDED_REQUEST_HEADERS}
         url = await OpenJev.get_url.aio()
-        async with _client(url, timeout=150) as client:
+        async with _server_client(url, timeout=150) as client:
             upstream = await client.request(
                 request.method, "/" + path, headers=headers, content=await request.body()
+            )
+        if upstream.status_code == 503:
+            # A cold Server answers 503 until SGLang is up; this request also starts it.
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "The GPU server is starting up (a few minutes from cold). "
+                        "Retry shortly."
+                    }
+                },
+                503,
+                {"Retry-After": "10"},
             )
         return Response(
             upstream.content,
@@ -219,7 +246,7 @@ async def main():
 
     from openjev.smoke import smoke_test
 
-    url = await OpenJev.get_url.aio()
+    url = await web.get_web_url.aio()
     print(f"OpenJev: {url}")
     result = await smoke_test(url)
     (ROOT / "smoke-result.json").write_text(json.dumps(result, indent=2) + "\n")

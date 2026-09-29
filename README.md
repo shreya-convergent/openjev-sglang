@@ -18,10 +18,11 @@ uv sync
 # Only if you haven't authenticated Modal on this machine:
 uv run modal setup
 
-# Create a proxy auth token (Modal dashboard → Settings → Proxy Auth Tokens) and
-# export it as "wk-....ws-..." for the smoke test and evals (or put it in .env):
-export OPENJEV_API_KEY=wk-....ws-...
-uv run modal secret create openjev-sglang-proxy-auth OPENJEV_API_KEY="$OPENJEV_API_KEY"
+# Create a proxy auth token (Modal dashboard → Settings → Proxy Auth Tokens) for the
+# web app, and choose the shared password that callers use:
+uv run modal secret create openjev-sglang-proxy-auth MODAL_PROXY_TOKEN=wk-....ws-...
+uv run modal secret create openjev-sglang-api-key OPENJEV_API_KEY=...
+export OPENJEV_API_KEY=...  # the password, for the smoke test and evals (or use .env)
 
 # Start a temporary Server, run actual inference checks, then shut it down:
 uv run modal run modal_app.py
@@ -30,24 +31,16 @@ uv run modal run modal_app.py
 uv run modal deploy modal_app.py
 ```
 
-The deployment prints two URLs. The GPU Server (`https://...us-west.modal.direct`) is a
-[Modal Server](https://modal.com/docs/guide/servers) with
-[proxy auth](https://modal.com/docs/guide/webhook-proxy-auth),
-`routing_region="us-west"`, and `compute_region=["us-west", "us-central", "us"]`.
-It runs at most one B200 (`max_containers=1`) and scales to zero after five idle minutes.
-Set `min_containers=1` in `modal_app.py` to keep a B200 warm.
+The deployment prints two URLs. Share the web app
+(`https://YOUR-WORKSPACE--openjev-sglang-web.modal.run`) and the password; callers
+send `Authorization: Bearer $OPENJEV_API_KEY`. The web app is CPU-only:
 
-Every Server request needs the token, either as `Modal-Key`/`Modal-Secret` headers or
-as `Authorization: Bearer wk-....ws-...`. Modal rejects requests without it at its
-proxy, so they never start a GPU container.
-
-The CPU-only web app (`https://YOUR-WORKSPACE--openjev-sglang-web.modal.run`) serves
-what a browser needs without starting the GPU:
-
-- `GET /`: the API reference. Enter the token in its auth panel to send requests.
-- `/v1/*` and `/health`: passed through to the Server with the caller's own token.
-  The web app accepts only the `Authorization: Bearer` form.
+- `GET /`: the API reference. Enter the password in its auth panel to send requests.
+- `/v1/*` and `/health`: checked against the password, then forwarded to the GPU Server.
+  While the Server starts from cold, these return 503 with a "starting up" message.
 - `POST /warm`: wakes the Server without keeping it warm.
+
+Wrong or missing passwords are rejected on the CPU web app, so they never start a GPU.
 
 ```sh
 curl -X POST https://YOUR-WORKSPACE--openjev-sglang-web.modal.run/warm \
@@ -55,9 +48,18 @@ curl -X POST https://YOUR-WORKSPACE--openjev-sglang-web.modal.run/warm \
 # {"status": "starting", "url": "..."}  — later calls return "ready"
 ```
 
-`/warm` returns at once and spawns a background poller that retries `/health` until
-the GPU container is serving. The usual five-minute scaledown window then starts,
+`/warm` returns at once and starts a background poller (`wait_until_ready`) that
+logs and retries `/health` every five seconds until the GPU container is serving.
+Only one poller runs at a time. The usual five-minute scaledown window then starts,
 so send requests within that window or warm it again.
+
+The GPU Server (`https://...us-west.modal.direct`) is a
+[Modal Server](https://modal.com/docs/guide/servers) with
+[proxy auth](https://modal.com/docs/guide/webhook-proxy-auth); only the web app
+holds its token. It uses `routing_region="us-west"` and
+`compute_region=["us-west", "us-central", "us"]`, runs at most one B200
+(`max_containers=1`), and scales to zero after five idle minutes.
+Set `min_containers=1` in `modal_app.py` to keep a B200 warm.
 
 If SGLang exits unexpectedly, the API exits too. The Modal launcher watches the
 API and exits the container so Modal can replace it, rather than leaving a live
@@ -223,8 +225,8 @@ All settings can be provided as `OPENJEV_*` environment variables; see
 The Modal launch script forwards `OPENJEV_PROFILE`, `OPENJEV_FRONTEND`, and
 `OPENJEV_SERVED_MODEL_NAME` from the local environment. To customize other remote settings,
 add them to `image.env(...)` or
-use a Modal Secret for keys. On Modal, `OPENJEV_API_KEY` is the proxy token used by clients;
-the API's own optional Bearer check stays unset.
+use a Modal Secret for keys. On Modal, the web app checks `OPENJEV_API_KEY`; the API's own
+optional Bearer check stays unset on the GPU Server.
 
 OpenJev defines
 `confidence = 1 - H(probabilities) / log(number_of_options)`, clamped to [0, 1].
