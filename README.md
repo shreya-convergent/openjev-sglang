@@ -46,6 +46,7 @@ what a browser needs without starting the GPU:
 
 - `GET /`: the API reference. Enter the token in its auth panel to send requests.
 - `/v1/*` and `/health`: passed through to the Server with the caller's own token.
+  The web app accepts only the `Authorization: Bearer` form.
 - `POST /warm`: wakes the Server without keeping it warm.
 
 ```sh

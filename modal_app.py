@@ -93,7 +93,8 @@ web_image = (
     )
     .add_local_python_source("openjev")
 )
-FORWARDED_REQUEST_HEADERS = {"authorization", "modal-key", "modal-secret", "content-type"}
+# Modal strips Modal-Key/Modal-Secret before they reach the app, so callers use Bearer.
+FORWARDED_REQUEST_HEADERS = {"authorization", "content-type"}
 FORWARDED_RESPONSE_HEADERS = {"content-type", "retry-after", "server-timing"}
 
 
@@ -107,9 +108,12 @@ async def _server_ready(client) -> bool:
     import httpx
 
     try:
-        return (await client.get("/health", timeout=10)).is_success
+        response = await client.get("/health", timeout=10)
     except (httpx.ConnectError, httpx.TimeoutException):
         return False
+    if response.status_code in {401, 403}:
+        raise PermissionError(f"Server rejected the proxy auth token: {response.text}")
+    return response.is_success
 
 
 @app.function(image=web_image, secrets=[proxy_token], timeout=1500)
@@ -135,7 +139,6 @@ def web():
     from openjev.config import Settings
 
     token = os.environ["OPENJEV_API_KEY"]
-    key, _, secret = token.partition(".")
     web = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     schema = create_app(Settings()).openapi()
     schema["components"]["securitySchemes"] = {
@@ -148,11 +151,7 @@ def web():
     schema["security"] = [{"modal": []}]
 
     def authorized(request: Request) -> bool:
-        bearer = request.headers.get("authorization", "")
-        pair = request.headers.get("modal-key", "") + "." + request.headers.get("modal-secret", "")
-        return secrets.compare_digest(bearer, f"Bearer {token}") or secrets.compare_digest(
-            pair, f"{key}.{secret}"
-        )
+        return secrets.compare_digest(request.headers.get("authorization", ""), f"Bearer {token}")
 
     @web.get("/", include_in_schema=False)
     async def reference():
@@ -183,8 +182,11 @@ def web():
             raise HTTPException(401, "Missing or invalid Modal proxy auth token")
         url = await OpenJev.get_url.aio()
         async with _client(url, headers={"Authorization": f"Bearer {token}"}) as client:
-            if await _server_ready(client):
-                return {"status": "ready", "url": url}
+            try:
+                if await _server_ready(client):
+                    return {"status": "ready", "url": url}
+            except PermissionError as exc:
+                raise HTTPException(502, str(exc)) from exc
         await wait_until_ready.spawn.aio()
         return {"status": "starting", "url": url}
 
