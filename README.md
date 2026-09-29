@@ -18,18 +18,46 @@ uv sync
 # Only if you haven't authenticated Modal on this machine:
 uv run modal setup
 
+# Create a proxy auth token (Modal dashboard → Settings → Proxy Auth Tokens) and
+# export it as "wk-....ws-..." for the smoke test and evals (or put it in .env):
+export OPENJEV_API_KEY=wk-....ws-...
+uv run modal secret create openjev-sglang-proxy-auth OPENJEV_API_KEY="$OPENJEV_API_KEY"
+
 # Start a temporary Server, run actual inference checks, then shut it down:
 uv run modal run modal_app.py
 
-# Deploy a stable public endpoint:
+# Deploy a stable endpoint:
 uv run modal deploy modal_app.py
 ```
 
-The deployment prints a `https://...us-west.modal.direct` URL. It uses a
-[Modal Server](https://modal.com/docs/guide/servers), `unauthenticated=True`,
+The deployment prints two URLs. The GPU Server (`https://...us-west.modal.direct`) is a
+[Modal Server](https://modal.com/docs/guide/servers) with
+[proxy auth](https://modal.com/docs/guide/webhook-proxy-auth),
 `routing_region="us-west"`, and `compute_region=["us-west", "us-central", "us"]`.
-Autoscaling has no explicit container cap and scales to zero after five idle minutes.
+It runs at most one B200 (`max_containers=1`) and scales to zero after five idle minutes.
 Set `min_containers=1` in `modal_app.py` to keep a B200 warm.
+
+Every Server request needs the token, either as `Modal-Key`/`Modal-Secret` headers or
+as `Authorization: Bearer wk-....ws-...`. Modal rejects requests without it at its
+proxy, so they never start a GPU container.
+
+The CPU-only web app (`https://YOUR-WORKSPACE--openjev-sglang-web.modal.run`) serves
+what a browser needs without starting the GPU:
+
+- `GET /`: the API reference. Enter the token in its auth panel to send requests.
+- `/v1/*` and `/health`: passed through to the Server with the caller's own token.
+- `POST /warm`: wakes the Server without keeping it warm.
+
+```sh
+curl -X POST https://YOUR-WORKSPACE--openjev-sglang-web.modal.run/warm \
+  -H "Authorization: Bearer $OPENJEV_API_KEY"
+# {"status": "starting", "url": "..."}  — later calls return "ready"
+```
+
+`/warm` returns at once and spawns a background poller that retries `/health` until
+the GPU container is serving. The usual five-minute scaledown window then starts,
+so send requests within that window or warm it again.
+
 If SGLang exits unexpectedly, the API exits too. The Modal launcher watches the
 API and exits the container so Modal can replace it, rather than leaving a live
 HTTP process with a dead inference backend. Normal shutdown disarms both watchers.
@@ -59,6 +87,7 @@ latency, and cache usage. `modal run` saves this report as `smoke-result.json`.
 
 ```sh
 curl "$OPENJEV_URL/v1/systemone" \
+  -H "Authorization: Bearer $OPENJEV_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "jev-latest",
@@ -85,7 +114,7 @@ curl "$OPENJEV_URL/v1/systemone" \
   }'
 ```
 
-Or use `curl "$OPENJEV_URL/v1/systemone" -H 'Content-Type: application/json' --data-binary @examples/request.json`.
+Or send `examples/request.json` with the same headers and `--data-binary @examples/request.json`.
 
 `state`, `instructions`, and criteria descriptions accept strings, JSON objects, or
 arrays. Criteria descriptions may also be `null`, in which case the option label is
@@ -167,7 +196,7 @@ usage counts, not TypeSafe billing estimates or unique tokens actually computed.
 
 Defaults are **64 questions**, **2–64 answers per Choice/Score**, **2 MiB JSON**,
 **32,768 tokens per branch including its output**, **262,144 total submitted input
-tokens**, **16 simultaneous evaluations**, and **64 simultaneous backend calls**.
+tokens**, **64 simultaneous evaluations**, and **64 simultaneous backend calls**.
 Invalid requests return 422 before inference; oversized bodies return 413;
 overload returns 529 with `Retry-After`. Backend timeouts return 504. Failed or
 cancelled evaluations cancel sibling requests and attempt to abort them in SGLang.
@@ -183,7 +212,7 @@ All settings can be provided as `OPENJEV_*` environment variables; see
 | `OPENJEV_FRONTEND`                | `rust` (`python` is an explicit fallback)               |
 | `OPENJEV_MAX_INPUT_TOKENS`        | `32768`                                                 |
 | `OPENJEV_MAX_TOTAL_INPUT_TOKENS`  | `262144`                                                |
-| `OPENJEV_MAX_CONCURRENT_REQUESTS` | `16`                                                    |
+| `OPENJEV_MAX_CONCURRENT_REQUESTS` | `64`                                                    |
 | `OPENJEV_MAX_CONCURRENT_BRANCHES` | `64`                                                    |
 | `OPENJEV_REQUEST_TIMEOUT`         | `120` seconds                                           |
 | `OPENJEV_TEMPERATURE`             | `1.0`, applied during label normalization               |
@@ -193,7 +222,8 @@ All settings can be provided as `OPENJEV_*` environment variables; see
 The Modal launch script forwards `OPENJEV_PROFILE`, `OPENJEV_FRONTEND`, and
 `OPENJEV_SERVED_MODEL_NAME` from the local environment. To customize other remote settings,
 add them to `image.env(...)` or
-use a Modal Secret for keys. The default Modal endpoint intentionally has no auth.
+use a Modal Secret for keys. On Modal, `OPENJEV_API_KEY` is the proxy token used by clients;
+the API's own optional Bearer check stays unset.
 
 OpenJev defines
 `confidence = 1 - H(probabilities) / log(number_of_options)`, clamped to [0, 1].

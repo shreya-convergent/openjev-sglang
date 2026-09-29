@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -100,6 +101,8 @@ async def collect(args):
         )
     started = time.monotonic()
     headers = {"Modal-Session-ID": "openjev-boolq-eval"}
+    if key := os.environ.get("OPENJEV_API_KEY"):
+        headers["Authorization"] = f"Bearer {key}"
     if is_jev:
         headers = {
             "Authorization": "Bearer "

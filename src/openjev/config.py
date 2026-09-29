@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     max_body_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
     max_input_tokens: int = Field(default=32768, ge=256)
     max_total_input_tokens: int = Field(default=262144, gt=0)
-    max_concurrent_requests: int = Field(default=16, gt=0)
+    max_concurrent_requests: int = Field(default=64, gt=0)
     max_concurrent_branches: int = Field(default=64, gt=0)
     request_timeout: float = Field(default=120, gt=0)
     startup_timeout: float = Field(default=1200, gt=0)

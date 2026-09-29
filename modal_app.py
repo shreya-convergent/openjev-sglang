@@ -3,6 +3,7 @@ uv run modal deploy modal_app.py  (persistent .modal.direct endpoint)
 """
 
 import os
+import secrets
 from pathlib import Path
 
 import modal
@@ -14,6 +15,8 @@ PROFILE_NAME = os.environ.get("OPENJEV_PROFILE", "qwen36")
 profile = PROFILES[PROFILE_NAME]
 app = modal.App(profile.app_name)
 cache = modal.Volume.from_name("openjev-huggingface", create_if_missing=True)
+# Modal proxy auth token as "wk-....ws-...", used by the web app to warm the Server.
+proxy_token = modal.Secret.from_name("openjev-sglang-proxy-auth", required_keys=["OPENJEV_API_KEY"])
 
 # Keep SGLang's tested CUDA environment intact. uv owns a separate, small API
 # environment; the package starts SGLang using the base image's Python.
@@ -53,8 +56,8 @@ image = (
     port=8000,
     routing_region="us-west",
     compute_region=["us-west", "us-central", "us"],
-    unauthenticated=True,
     min_containers=0,
+    max_containers=1,
     target_concurrency=8,
     scaledown_window=300,
     startup_timeout=1200,
@@ -73,6 +76,139 @@ class OpenJev:
 
         if hasattr(self, "process"):
             stop_background(self.process)
+
+
+# The Server requires Modal proxy auth, so Modal rejects unauthenticated requests
+# before they can start a B200. This CPU-only web app hosts what a browser needs:
+# the API reference, a warm-up route, and a same-origin pass-through to the Server
+# that forwards the caller's own credentials (it never adds its own).
+web_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install(
+        "fastapi[standard]>=0.115,<1",
+        "httpx>=0.28,<1",
+        "jinja2>=3.1.6,<4",
+        "orjson>=3.10,<4",
+        "pydantic-settings>=2.8,<3",
+    )
+    .add_local_python_source("openjev")
+)
+FORWARDED_REQUEST_HEADERS = {"authorization", "modal-key", "modal-secret", "content-type"}
+FORWARDED_RESPONSE_HEADERS = {"content-type", "retry-after", "server-timing"}
+
+
+def _client(url: str, **kwargs):
+    import httpx
+
+    return httpx.AsyncClient(base_url=url.rstrip("/"), **kwargs)
+
+
+async def _server_ready(client) -> bool:
+    import httpx
+
+    try:
+        return (await client.get("/health", timeout=10)).is_success
+    except (httpx.ConnectError, httpx.TimeoutException):
+        return False
+
+
+@app.function(image=web_image, secrets=[proxy_token], timeout=1500)
+async def wait_until_ready():
+    """Poll a cold Server (503 while starting) until /health succeeds."""
+    import asyncio
+
+    url = await OpenJev.get_url.aio()
+    auth = {"Authorization": f"Bearer {os.environ['OPENJEV_API_KEY']}"}
+    async with _client(url, headers=auth) as client:
+        while not await _server_ready(client):
+            await asyncio.sleep(5)
+
+
+@app.function(image=web_image, secrets=[proxy_token])
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app(label=f"{profile.app_name}-web")
+def web():
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import HTMLResponse, Response
+
+    from openjev.api import create_app
+    from openjev.config import Settings
+
+    token = os.environ["OPENJEV_API_KEY"]
+    key, _, secret = token.partition(".")
+    web = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    schema = create_app(Settings()).openapi()
+    schema["components"]["securitySchemes"] = {
+        "modal": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "Modal proxy auth token, formatted as `wk-....ws-...`.",
+        }
+    }
+    schema["security"] = [{"modal": []}]
+
+    def authorized(request: Request) -> bool:
+        bearer = request.headers.get("authorization", "")
+        pair = request.headers.get("modal-key", "") + "." + request.headers.get("modal-secret", "")
+        return secrets.compare_digest(bearer, f"Bearer {token}") or secrets.compare_digest(
+            pair, f"{key}.{secret}"
+        )
+
+    @web.get("/", include_in_schema=False)
+    async def reference():
+        return HTMLResponse("""<!doctype html>
+<html lang="en">
+  <head>
+    <title>OpenJev API Reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <script>
+      Scalar.createApiReference('#app', { url: '/openapi.json' });
+    </script>
+  </body>
+</html>""")
+
+    @web.get("/openapi.json", include_in_schema=False)
+    async def openapi():
+        return schema
+
+    @web.post("/warm", include_in_schema=False)
+    async def warm(request: Request):
+        """Return immediately: "ready" if a GPU container is serving, else start one."""
+        if not authorized(request):
+            raise HTTPException(401, "Missing or invalid Modal proxy auth token")
+        url = await OpenJev.get_url.aio()
+        async with _client(url, headers={"Authorization": f"Bearer {token}"}) as client:
+            if await _server_ready(client):
+                return {"status": "ready", "url": url}
+        await wait_until_ready.spawn.aio()
+        return {"status": "starting", "url": url}
+
+    @web.api_route("/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+    async def forward(path: str, request: Request):
+        if path not in {"v1/systemone", "v1/models", "v1/limits", "health", "health/live"}:
+            raise HTTPException(404)
+        headers = {k: v for k, v in request.headers.items() if k in FORWARDED_REQUEST_HEADERS}
+        url = await OpenJev.get_url.aio()
+        async with _client(url, timeout=150) as client:
+            upstream = await client.request(
+                request.method, "/" + path, headers=headers, content=await request.body()
+            )
+        return Response(
+            upstream.content,
+            upstream.status_code,
+            {
+                k: v
+                for k, v in upstream.headers.items()
+                if k in FORWARDED_RESPONSE_HEADERS or k.startswith("x-openjev-")
+            },
+        )
+
+    return web
 
 
 @app.local_entrypoint()
