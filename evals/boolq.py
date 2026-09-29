@@ -100,7 +100,7 @@ async def collect(args):
             + "\n"
         )
     started = time.monotonic()
-    headers = {"Modal-Session-ID": "openjev-boolq-eval"}
+    headers = {"Modal-Session-ID": "openjev-boolq-eval"} if ".modal.direct" in endpoint else {}
     if key := os.environ.get("OPENJEV_API_KEY"):
         headers["Authorization"] = f"Bearer {key}"
     if is_jev:

@@ -86,7 +86,7 @@ async def main(args):
     for i in indices:
         if i not in done:
             queue.put_nowait(i)
-    headers = {"Modal-Session-ID": "openjev-mmlu-pro-eval"}
+    headers = {"Modal-Session-ID": "openjev-mmlu-pro-eval"} if ".modal.direct" in endpoint else {}
     if key := os.environ.get("OPENJEV_API_KEY"):
         headers["Authorization"] = f"Bearer {key}"
     if is_jev:

@@ -8,7 +8,8 @@ import httpx
 
 async def smoke_test(url: str, timeout: float = 1200) -> dict:
     """Exercise real inference; no mock fallback or fabricated probabilities."""
-    headers = {"Modal-Session-ID": "openjev-smoke"}
+    # modal.run web endpoints reject Modal-* headers; session affinity only applies to Servers.
+    headers = {"Modal-Session-ID": "openjev-smoke"} if ".modal.direct" in url else {}
     if key := os.environ.get("OPENJEV_API_KEY"):
         headers["Authorization"] = f"Bearer {key}"
     deadline = time.monotonic() + timeout
