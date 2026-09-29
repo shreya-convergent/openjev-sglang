@@ -229,7 +229,9 @@ def web():
             print(f"Forwarding {request.method} /{path} failed: {exc!r}")
             return unavailable("The GPU server restarted during this request. Retry shortly.")
         if upstream.status_code == 503:
-            # A cold Server answers 503 until SGLang is up; this request also starts it.
+            # A cold Server answers 503 until SGLang is up. Modal's idle timer counts from the
+            # last request, so keep polling until ready or the Server may scale down right after.
+            await wait_until_ready.spawn.aio()
             return unavailable(
                 "The GPU server is starting up (a few minutes from cold). Retry shortly."
             )

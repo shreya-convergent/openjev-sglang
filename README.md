@@ -37,7 +37,8 @@ send `Authorization: Bearer $OPENJEV_API_KEY`. The web app is CPU-only:
 
 - `GET /`: the API reference. Enter the password in its auth panel to send requests.
 - `/v1/*` and `/health`: checked against the password, then forwarded to the GPU Server.
-  While the Server starts from cold, these return 503 with a "starting up" message.
+  While the Server starts from cold, these return 503 with a "starting up" message and
+  start the same poller as `/warm`, so the Server stays up once it's ready.
 - `POST /warm`: wakes the Server without keeping it warm.
 
 Wrong or missing passwords are rejected on the CPU web app, so they never start a GPU.
