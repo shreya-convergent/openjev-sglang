@@ -145,6 +145,7 @@ async def wait_until_ready():
 @modal.concurrent(max_inputs=100)
 @modal.asgi_app(label=f"{profile.app_name}-web")
 def web():
+    import httpx
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -188,6 +189,13 @@ def web():
     async def openapi():
         return schema
 
+    def unavailable(message: str):
+        return JSONResponse({"error": {"message": message}}, 503, {"Retry-After": "10"})
+
+    @web.get("/warm", include_in_schema=False)
+    async def warm_get():
+        raise HTTPException(405, "Use POST /warm with the password", {"Allow": "POST"})
+
     @web.post("/warm", include_in_schema=False)
     async def warm(request: Request):
         """Return immediately: "ready" if a GPU container is serving, else start one."""
@@ -211,21 +219,19 @@ def web():
             raise HTTPException(401, "Missing or invalid password", {"WWW-Authenticate": "Bearer"})
         headers = {k: v for k, v in request.headers.items() if k in FORWARDED_REQUEST_HEADERS}
         url = await OpenJev.get_url.aio()
-        async with _server_client(url, timeout=150) as client:
-            upstream = await client.request(
-                request.method, "/" + path, headers=headers, content=await request.body()
-            )
+        try:
+            async with _server_client(url, timeout=150) as client:
+                upstream = await client.request(
+                    request.method, "/" + path, headers=headers, content=await request.body()
+                )
+        except httpx.HTTPError as exc:
+            # The GPU container went away mid-request (e.g. preemption or scale-down).
+            print(f"Forwarding {request.method} /{path} failed: {exc!r}")
+            return unavailable("The GPU server restarted during this request. Retry shortly.")
         if upstream.status_code == 503:
             # A cold Server answers 503 until SGLang is up; this request also starts it.
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "The GPU server is starting up (a few minutes from cold). "
-                        "Retry shortly."
-                    }
-                },
-                503,
-                {"Retry-After": "10"},
+            return unavailable(
+                "The GPU server is starting up (a few minutes from cold). Retry shortly."
             )
         return Response(
             upstream.content,
