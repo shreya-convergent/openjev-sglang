@@ -101,6 +101,29 @@ The smoke test covers all three answer types, a 64-answer question, basic semant
 sanity checks, and rejection of 65 answers. It reports startup wait, inference
 latency, and cache usage. `modal run` saves this report as `smoke-result.json`.
 
+### pplx-decider
+
+`modal_app.py` also deploys
+[perplexity-ai/pplx-decider-v1.1-27b](https://huggingface.co/perplexity-ai/pplx-decider-v1.1-27b)
+as a separate Modal app with its own GPU and web app, behind the same password:
+
+```sh
+OPENJEV_PROFILE=pplx-decider uv run modal deploy modal_app.py
+# https://YOUR-WORKSPACE--pplx-decider-web.modal.run
+```
+
+The decider is a Qwen3.8-27B backbone with a separate 255-way readout head and
+noncausal full attention, so SGLang can't serve it as published. Instead the GPU
+Server runs the checkpoint's bundled `autojev` server (pinned to revision
+`6195aa5`), which speaks the same `/v1/systemone` API with its own limits: up to
+255 choice options, 2–10 score levels, up to four images, and 8,192 tokens per
+decision. It prefers a B200 and falls back to an H100 (the BF16 weights use about
+50 GiB). Weights download once into the shared Volume; GPU snapshots hold the
+loaded model, so restores skip loading and kernel compilation.
+
+autojev evaluates one request at a time and answers others with 529. The web app
+retries 529s for up to 60 seconds, so concurrent callers queue instead of failing.
+
 ## Request
 
 ```sh

@@ -48,21 +48,26 @@ def start_background(
     ]
     if sglang_args:
         command += ["--", *sglang_args]
-    process = subprocess.Popen(command, start_new_session=True)
+    return start_server(command, "http://127.0.0.1:8000/health", "OpenJev API", timeout)
+
+
+def start_server(command: list[str], health_url: str, name: str, timeout: float = 1200, env=None):
+    """Start a supervised HTTP server process and wait until `health_url` returns 200."""
+    process = subprocess.Popen(command, env=env, start_new_session=True)
     deadline = time.monotonic() + timeout
     try:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise RuntimeError(f"OpenJev exited with status {process.returncode}")
+                raise RuntimeError(f"{name} exited with status {process.returncode}")
             try:
-                with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=5) as response:
+                with urllib.request.urlopen(health_url, timeout=5) as response:
                     if response.status == 200:
-                        process.openjev_stopping = watch_process(process, "OpenJev API")
+                        process.openjev_stopping = watch_process(process, name)
                         return process
             except (OSError, urllib.error.URLError):
                 pass
             time.sleep(1)
-        raise TimeoutError("OpenJev did not start before the startup deadline")
+        raise TimeoutError(f"{name} did not start before the startup deadline")
     except BaseException:
         stop_background(process)
         raise
@@ -105,6 +110,11 @@ def wake_backend(api_url: str, backend_url: str, warmup: bytes, attempts: int = 
     post_local(f"{backend_url}/resume_memory_occupation")
     # KV contents did not survive the release, so cached prefixes must not be reused.
     post_local(f"{backend_url}/flush_cache")
+    verify_evaluation(api_url, warmup, attempts)
+
+
+def verify_evaluation(api_url: str, warmup: bytes, attempts: int = 3):
+    """Run one real evaluation, retrying briefly in case pooled connections went stale."""
     for attempt in range(attempts):
         try:
             post_local(f"{api_url}/v1/systemone", warmup)
